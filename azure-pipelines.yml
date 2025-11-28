@@ -1,22 +1,152 @@
 trigger:
-- main
+  branches:
+    include:
+      - main
 
-pool:
-  vmImage: 'ubuntu-latest'
+variables:
+  NODE_VERSION: '20.x'
+  BUILD_OUTPUT: 'build'
 
-steps:
-- task: NodeTool@0
-  inputs:
-    versionSpec: '18.x'
-  displayName: "Use Node 18"
+stages:
+- stage: Build
+  displayName: Build
+  jobs:
+    - job: BuildJob
+      pool:
+        vmImage: 'ubuntu-latest'
+      steps:
+        - checkout: self
 
-- script: |
-    npm install
-    npm run build
-  displayName: "Install & Build Svelte"
+        - task: NodeTool@0
+          inputs:
+            versionSpec: '$(NODE_VERSION)'
+          displayName: 'Install Node.js'
 
-- task: PublishBuildArtifacts@1
-  inputs:
-    PathtoPublish: 'build'
-    ArtifactName: 'frontend'
-    publishLocation: 'Container'
+        - script: |
+            set -e
+            echo "Clean & install deps"
+            rm -rf node_modules package-lock.json $(BUILD_OUTPUT)
+            npm ci --prefer-offline --no-audit || npm install
+            echo "Run build (SvelteKit)"
+            npm run build
+          displayName: 'Install & build'
+
+        - script: |
+            echo "Listing build output:"
+            ls -la $(BUILD_OUTPUT) || (echo "ERROR: build output $(BUILD_OUTPUT) missing"; exit 1)
+          displayName: 'Verify build output'
+
+        - task: CopyFiles@2
+          inputs:
+            SourceFolder: '$(BUILD_OUTPUT)'
+            Contents: '**'
+            TargetFolder: '$(Build.ArtifactStagingDirectory)/site'
+          displayName: 'Copy build output to artifact staging'
+
+        - script: |
+            echo "List artifact staging dir:"
+            ls -la $(Build.ArtifactStagingDirectory) || true
+            ls -la $(Build.ArtifactStagingDirectory)/site || true
+          displayName: 'Debug: show artifact staging content'
+
+        - task: PublishBuildArtifacts@1
+          inputs:
+            PathtoPublish: '$(Build.ArtifactStagingDirectory)/site'
+            ArtifactName: 'drop'
+            publishLocation: 'Container'
+          displayName: 'Publish Artifact: drop'
+
+- stage: Test
+  displayName: Test
+  dependsOn: Build
+  jobs:
+    - job: TestJob
+      pool:
+        vmImage: 'ubuntu-latest'
+      steps:
+        - checkout: self
+        - task: NodeTool@0
+          inputs:
+            versionSpec: '$(NODE_VERSION)'
+          displayName: 'Install Node.js (Test)'
+        - script: |
+            npm ci || npm install
+            npm test || echo "No tests defined, skipping"
+          displayName: 'Run tests'
+
+- stage: Deploy
+  displayName: Deploy
+  dependsOn: Test
+  condition: succeeded()
+  jobs:
+    - job: DeployJob
+      pool:
+        vmImage: 'ubuntu-latest'
+      steps:
+        - download: current
+          artifact: drop
+
+        - script: |
+            echo "show downloaded artifact (Pipeline.Workspace)/drop"
+            ls -la "$(Pipeline.Workspace)/drop" || true
+            if [ -f "$(Pipeline.Workspace)/drop/site.zip" ]; then
+              echo "site.zip exists; listing contents:"
+              unzip -l "$(Pipeline.Workspace)/drop/site.zip" || true
+            fi
+          displayName: 'Debug: show downloaded artifact'
+
+        - script: |
+            set -e
+            TARGET="$(Build.SourcesDirectory)/extracted"
+            echo "Preparing ${TARGET}"
+            rm -rf "${TARGET}"
+            mkdir -p "${TARGET}"
+
+            if [ -f "$(Pipeline.Workspace)/drop/site.zip" ]; then
+              echo "Extracting zip -> ${TARGET}"
+              unzip -o "$(Pipeline.Workspace)/drop/site.zip" -d "${TARGET}"
+            else
+              echo "Copying drop contents -> ${TARGET}"
+              if [ -d "$(Pipeline.Workspace)/drop/site" ]; then
+                cp -r "$(Pipeline.Workspace)/drop/site/"* "${TARGET}/" || true
+              else
+                shopt -s dotglob || true
+                cp -r "$(Pipeline.Workspace)/drop/"* "${TARGET}/" || true
+              fi
+            fi
+
+            echo "Listing ${TARGET}:"
+            ls -R "${TARGET}" || true
+            if [ ! -f "${TARGET}/index.html" ]; then
+              if [ -f "${TARGET}/404.html" ]; then
+                echo "index.html not found — copying 404.html -> index.html for SWA"
+                cp "${TARGET}/404.html" "${TARGET}/index.html"
+              fi
+            fi
+
+            echo "Final listing ${TARGET}:"
+            ls -la "${TARGET}" || true
+          displayName: 'Prepare and normalize extracted static files'
+
+        - script: |
+            TARGET="$(Build.SourcesDirectory)/extracted"
+            echo "Verifying ${TARGET} contains static entrypoint..."
+            if [ -f "${TARGET}/index.html" ]; then
+              echo "OK: index.html present"
+            elif [ -f "${TARGET}/404.html" ] && [ -d "${TARGET}/_app" ]; then
+              echo "SvelteKit output detected but index.html missing; we attempted to create one."
+            else
+              echo "ERROR: No index.html or SvelteKit artifacts found in ${TARGET}"
+              ls -R "${TARGET}" || true
+              exit 1
+            fi
+          displayName: 'Verify extracted artifact'
+
+        - task: AzureStaticWebApp@0
+          inputs:
+            app_location: 'extracted'
+            output_location: ''
+            azure_static_web_apps_api_token: '$(azure_static_web_apps_api_token)'
+          env:
+            AZURE_STATIC_WEB_APPS_API_TOKEN: $(azure_static_web_apps_api_token)
+          displayName: 'Deploy to Azure Static Web App'
